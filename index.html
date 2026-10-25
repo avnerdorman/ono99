@@ -1142,7 +1142,7 @@ function processCurrentTurn() {
 
   if (player.isHuman) {
     state.humanTurnActive = true;
-    setStatus('Your turn — pick a card!', 'neutral');
+    setStatus(isPlay2Victim(0) ? 'Play 2 — you must play 2 cards!' : 'Your turn — pick a card!', isPlay2Victim(0) ? 'bad' : 'neutral');
     render();
   } else {
     state.humanTurnActive = false;
@@ -1167,11 +1167,12 @@ function nextTurn() {
   // Handle Play 2
   if (state.play2Pending) {
     state.play2Pending = false;
-    state.play2TurnsLeft = 2;
-    state.play2ActivePlayer = state.currentIdx;
     advance();
     // Skip eliminated
     while (state.players[state.currentIdx].eliminated) advance();
+    // The player who now takes the turn is the one who must play 2
+    state.play2TurnsLeft = 2;
+    state.play2ActivePlayer = state.currentIdx;
   } else if (state.play2TurnsLeft > 0 && state.currentIdx === state.play2ActivePlayer) {
     // We've come back around, clear
     state.play2TurnsLeft = 0;
@@ -1197,6 +1198,8 @@ function playCard(player, card, isSecondPlay2Turn, onDone) {
 
   // Apply effect
   const prevTotal = state.total;
+  // Reverse or Play 2 as the first card of a Play 2 deflects it
+  const deflecting = state.play2TurnsLeft === 2 && isPlay2Victim(state.players.indexOf(player));
 
   if (card.type === CARD_TYPES.NUMBER) {
     state.total = Math.min(99, state.total + card.value); // can't exceed in normal play
@@ -1213,24 +1216,26 @@ function playCard(player, card, isSecondPlay2Turn, onDone) {
     announceTotal(prevTotal, 0, state.total, 'hold', onDone);
   } else if (card.type === CARD_TYPES.REVERSE) {
     const active = getActivePlayers();
-    if (active.length === 2) {
+    if (active.length > 2) state.direction *= -1;
+    if (deflecting) {
+      // Bounce the Play 2 back to the player who sent it
+      state.play2TurnsLeft = 0;
+      state.play2ActivePlayer = -1;
+      state.play2Pending = true;
+      specialMsg = 'Reversed back!';
+    } else if (active.length === 2) {
       // Acts as hold
       specialMsg = 'Reverse (2 players = Hold)';
     } else {
-      state.direction *= -1;
       specialMsg = 'Reversed!';
     }
     playSpecialSound();
     announceTotal(prevTotal, 0, state.total, 'reverse', onDone);
   } else if (card.type === CARD_TYPES.PLAY2) {
-    if (state.play2TurnsLeft > 0) {
-      // Pass it forward — victim plays this as their first card, clearing the play2
-      state.play2TurnsLeft = 0;
-      state.play2ActivePlayer = -1;
-      state.play2Pending = true; // new play2 pending on the next person
-    } else {
-      state.play2Pending = true;
-    }
+    // Any Play 2 still owed by this player is cleared — the next player now owes it
+    state.play2TurnsLeft = 0;
+    state.play2ActivePlayer = -1;
+    state.play2Pending = true;
     specialMsg = 'Play 2!';
     playSpecialSound();
     announceTotal(prevTotal, 0, state.total, 'play2', onDone);
@@ -1271,42 +1276,40 @@ function humanPlayCard(card) {
 
   if (!canPlayCard(card, state.total, getActivePlayers().length)) return;
 
-  // Check for Play 2 situation — if we're in play2 and this is a Reverse, bounce it back
-  if (state.play2TurnsLeft > 0 && state.play2ActivePlayer === 0) {
-    if (card.type === CARD_TYPES.REVERSE) {
-      // Bounce back
-      state.play2TurnsLeft = 0;
-      state.play2ActivePlayer = -1;
-      state.play2Pending = false;
-      state.direction *= -1;
-      player.hand = player.hand.filter(c => c.id !== card.id);
-      state.discardPile.push(card);
-      drawCards(player, 1);
-      floatText('Reversed back!', '#4361ee');
-      playSpecialSound();
-      announceTotal(state.total, 0, state.total, 'reverse', () => nextTurn());
-      render();
-      state.humanTurnActive = false;
-      return;
-    }
-  }
-
   state.humanTurnActive = false;
-  playCard(player, card, false, () => {
-    if (state.play2TurnsLeft > 0 && state.play2ActivePlayer === 0) {
-      state.play2TurnsLeft--;
-      if (state.play2TurnsLeft > 0) {
+  playCard(player, card, false, () => finishPlay(player));
+}
+
+// After a card resolves: give a Play 2 victim their second card, or move on
+function finishPlay(player) {
+  if (state.gameOver) return;
+  const idx = state.players.indexOf(player);
+  if (isPlay2Victim(idx)) {
+    state.play2TurnsLeft--;
+    if (state.play2TurnsLeft > 0) {
+      // Second forced card — out if nothing can be played
+      if (!player.hand.some(c => canPlayCard(c, state.total, getActivePlayers().length))) {
+        eliminatePlayer(player);
+        return;
+      }
+      if (player.isHuman) {
         setStatus('Play 2 — play your second card!', 'bad');
         state.humanTurnActive = true;
         render();
-        return;
       } else {
-        state.play2ActivePlayer = -1;
+        setStatus(`${player.name} plays again...`, 'neutral');
+        setTimeout(() => cpuTakeTurn(player), 700);
       }
+      return;
     }
-    setStatus('', 'neutral');
-    nextTurn();
-  });
+    state.play2ActivePlayer = -1;
+  }
+  if (player.isHuman) setStatus('', 'neutral');
+  nextTurn();
+}
+
+function isPlay2Victim(idx) {
+  return state.play2TurnsLeft > 0 && state.play2ActivePlayer === idx;
 }
 
 // ===== CPU TURN =====
@@ -1319,10 +1322,8 @@ function cpuTakeTurn(player) {
   // Find playable cards
   let playable = player.hand.filter(c => canPlayCard(c, total, active.length));
 
-  // If in play2 situation, can respond with Reverse or Play2
-  let responding = false;
-  if (state.play2TurnsLeft > 0 && state.play2ActivePlayer === state.currentIdx) {
-    responding = true;
+  // Hit by a Play 2 (first card) — can deflect with Reverse or Play2
+  if (state.play2TurnsLeft === 2 && isPlay2Victim(state.currentIdx)) {
     const reverses = playable.filter(c => c.type === CARD_TYPES.REVERSE);
     const play2s = playable.filter(c => c.type === CARD_TYPES.PLAY2);
     if (reverses.length > 0 && total > 70) {
@@ -1373,39 +1374,18 @@ function cpuTakeTurn(player) {
 }
 
 function playCardWithDelay(player, card) {
-  const isPlay2Victim = state.play2TurnsLeft > 0 && state.play2ActivePlayer === state.currentIdx;
-  let desc = cardDisplayLabel(card);
-  setStatus(`${player.name} plays ${desc}`, 'neutral');
-
-  if (isPlay2Victim) {
-    state.play2TurnsLeft--;
-    if (state.play2TurnsLeft > 0) {
-      // First of 2 forced turns — after speech, do second turn
-      playCard(player, card, false, () => {
-        setStatus(`${player.name} plays again...`, 'neutral');
-        const playable = player.hand.filter(c => canPlayCard(c, state.total, getActivePlayers().length));
-        if (!playable.length) {
-          eliminatePlayer(player);
-          return;
-        }
-        const chosen = playable.sort((a,b) => a.value - b.value)[0];
-        setStatus(`${player.name} plays ${cardDisplayLabel(chosen)}`, 'neutral');
-        state.play2TurnsLeft = 0;
-        state.play2ActivePlayer = -1;
-        playCard(player, chosen, true, () => nextTurn());
-      });
-      return;
-    } else {
-      state.play2ActivePlayer = -1;
-    }
-  }
-
-  playCard(player, card, false, () => nextTurn());
+  setStatus(`${player.name} plays ${cardDisplayLabel(card)}`, 'neutral');
+  playCard(player, card, false, () => finishPlay(player));
 }
 
 // ===== ELIMINATION =====
 function eliminatePlayer(player) {
   player.eliminated = true;
+  // An eliminated player no longer owes a Play 2
+  if (isPlay2Victim(state.players.indexOf(player))) {
+    state.play2TurnsLeft = 0;
+    state.play2ActivePlayer = -1;
+  }
   playEliminatedSound();
   floatText('OUT! 💥', '#f72585');
 
